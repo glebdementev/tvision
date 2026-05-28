@@ -21,7 +21,11 @@ def _load_dotenv(path: str = ".env") -> None:
         if not line or line.startswith("#") or "=" not in line:
             continue
         k, v = line.split("=", 1)
-        os.environ.setdefault(k.strip(), v.strip())
+        key = k.strip().removeprefix("export ").strip()
+        value = v.strip().strip("'\"")
+        # Allow .env values to fill in variables that are unset or empty.
+        if not os.environ.get(key):
+            os.environ[key] = value
 
 
 def main(argv: list[str] | None = None) -> int:
