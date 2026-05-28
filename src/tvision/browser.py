@@ -33,6 +33,12 @@ class BrowserSession:
         )
         self._page = self._context.new_page()
         self._page.set_default_timeout(self.settings.nav_timeout_ms)
+        if self.settings.start_url:
+            self._page.goto(self.settings.start_url)
+            try:
+                self._page.wait_for_load_state("domcontentloaded", timeout=5000)
+            except Exception:
+                pass
 
     def actual_viewport(self) -> tuple[int, int]:
         size = self.page.evaluate("() => [window.innerWidth, window.innerHeight]")

@@ -40,6 +40,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-iters", type=int, default=None)
     parser.add_argument("--headless", action="store_true", help="Run Chromium headless")
     parser.add_argument("--trace-dir", default=None)
+    parser.add_argument(
+        "--url",
+        default=None,
+        help="Initial URL to load before the agent starts (default: google.com)",
+    )
     args = parser.parse_args(argv)
 
     settings = Settings()
@@ -51,6 +56,8 @@ def main(argv: list[str] | None = None) -> int:
         settings.headed = False
     if args.trace_dir:
         settings.trace_dir = args.trace_dir
+    if args.url is not None:
+        settings.start_url = args.url
 
     tracer = Tracer(settings.trace_dir, settings.screenshots_dir)
     client = make_client(settings)
@@ -64,6 +71,10 @@ def main(argv: list[str] | None = None) -> int:
                 f"[tvision] browser ready: viewport reports {actual[0]}x{actual[1]}"
                 f" (configured {settings.viewport_width}x{settings.viewport_height},"
                 f" headed={settings.headed})",
+                flush=True,
+            )
+            print(
+                f"[tvision] loaded start URL: {browser.page.url}",
                 flush=True,
             )
             loop = AgentLoop(client, browser, settings, tracer)

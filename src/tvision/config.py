@@ -18,6 +18,7 @@ class Settings:
     type_delay_ms: int = 20
     settle_delay_ms: int = 250
     nav_timeout_ms: int = 15000
+    start_url: str = "https://www.google.com"
     trace_dir: str = field(
         default_factory=lambda: os.getenv("TVISION_TRACE_DIR", "./traces")
     )
