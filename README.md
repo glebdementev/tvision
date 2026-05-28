@@ -1,13 +1,13 @@
 # tvision
 
-Vision-driven browser agent. Drives headed Chromium at 1280x720 using Qwen 3.6 via OpenRouter.
+Vision-driven browser agent. Drives headed Chromium at 1280x720 using `qwen/qwen3.6-35b-a3b` via OpenRouter.
 
 ## Quickstart
 
 ```bash
 pip install -e .
 playwright install chromium
-cp .env.example .env  # add OPENROUTER_API_KEY, set TVISION_MODEL slug
+cp .env.example .env  # paste your OPENROUTER_API_KEY
 tvision "open https://news.ycombinator.com, click the third story, then finish with its title"
 ```
 

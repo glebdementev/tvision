@@ -4,11 +4,9 @@ from dataclasses import dataclass
 
 @dataclass
 class Settings:
-    model: str = os.getenv("TVISION_MODEL", "qwen/qwen3-vl-plus")
+    model: str = "qwen/qwen3.6-35b-a3b"
     openrouter_api_key: str = os.getenv("OPENROUTER_API_KEY", "")
-    openrouter_base_url: str = os.getenv(
-        "OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"
-    )
+    openrouter_base_url: str = "https://openrouter.ai/api/v1"
     viewport_width: int = 1280
     viewport_height: int = 720
     headed: bool = True
