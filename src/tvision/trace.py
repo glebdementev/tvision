@@ -87,11 +87,11 @@ class Tracer:
             }
         )
 
-    def dump_request(self, step: int, payload: Any) -> Path:
-        return self._write_json(f"step-{step:03d}-request.json", payload)
+    def dump_request(self, tag: str, payload: Any) -> Path:
+        return self._write_json(f"step-{tag}-request.json", payload)
 
-    def dump_response(self, step: int, payload: Any) -> Path:
-        return self._write_json(f"step-{step:03d}-response.json", payload)
+    def dump_response(self, tag: str, payload: Any) -> Path:
+        return self._write_json(f"step-{tag}-response.json", payload)
 
     def close(self) -> None:
         self.log.close()

@@ -15,6 +15,17 @@ from .screenshot import data_url_png, png_size
 from .trace import Tracer
 
 
+EMPTY_NUDGE = (
+    "Your previous response produced no tool call (likely you stopped after "
+    "internal reasoning). You MUST emit exactly one tool call now. Pick the "
+    "next action and call `computer_use` with the appropriate `action` "
+    "field, or call `finish` if the task is complete. Do not produce only "
+    "text — emit the tool call."
+)
+
+MAX_ATTEMPTS_PER_STEP = 3
+
+
 @dataclass
 class FinishResult:
     success: bool
@@ -35,9 +46,6 @@ def _preview(s: str | None, n: int = 200) -> str:
 
 
 def _sanitize_for_dump(messages: list[dict]) -> list[dict]:
-    """Strip giant base64 image data URIs from a request payload before
-    writing to disk; replace with a size marker so the structure is still
-    readable."""
     out: list[dict] = []
     for m in messages:
         copy = dict(m)
@@ -89,6 +97,16 @@ class AgentLoop:
         self.tracer = tracer
         self.executor = Executor(browser, settings)
 
+    def _call_model(
+        self, messages: list[dict], *, force_tool: bool
+    ) -> Any:
+        return self.client.chat.completions.create(
+            model=self.settings.model,
+            messages=messages,
+            tools=TOOL_SCHEMAS,
+            tool_choice="required" if force_tool else "auto",
+        )
+
     def run(self, task: str) -> FinishResult:
         _log(
             f"[tvision] model={self.settings.model} "
@@ -126,118 +144,25 @@ class AgentLoop:
 
             self._prune_images(messages)
 
-            req_path = self.tracer.dump_request(step, _sanitize_for_dump(messages))
-            _log(
-                f"[tvision] step {step}: → POST /chat/completions "
-                f"msgs={len(messages)} (dump: {req_path.name})"
-            )
-            t0 = time.monotonic()
-            try:
-                resp = self.client.chat.completions.create(
-                    model=self.settings.model,
-                    messages=messages,
-                    tools=TOOL_SCHEMAS,
-                    tool_choice="auto",
-                )
-            except Exception as e:
-                _log(f"[tvision] step {step}: ✗ API error: {type(e).__name__}: {e}")
-                raise
-            dt = time.monotonic() - t0
-
-            resp_path = self.tracer.dump_response(step, _response_to_dict(resp))
-
-            choice = resp.choices[0]
-            msg = choice.message
-            tool_calls = list(msg.tool_calls or [])
-            usage = getattr(resp, "usage", None)
-            usage_str = (
-                f" tokens={usage.prompt_tokens}+{usage.completion_tokens}"
-                if usage
-                else ""
-            )
-            _log(
-                f"[tvision] step {step}: ← {dt:.2f}s "
-                f"finish={choice.finish_reason} tool_calls={len(tool_calls)}"
-                f"{usage_str} (dump: {resp_path.name})"
-            )
-
-            txt_path = self.tracer.record_assistant(
-                step,
-                msg.content,
-                [
-                    {"name": tc.function.name, "arguments": tc.function.arguments}
-                    for tc in tool_calls
-                ],
-            )
-
-            if msg.content:
-                # Print full text when no tool was called (the failure mode the
-                # user is debugging); preview otherwise so the log stays
-                # readable for the happy path.
-                if not tool_calls:
-                    _log(f"[tvision] step {step}:   assistant text (full):")
-                    for line in (msg.content or "").splitlines() or [""]:
-                        _log(f"[tvision]      | {line}")
-                    if txt_path:
-                        _log(f"[tvision]      saved → {txt_path}")
-                else:
-                    _log(f"[tvision] step {step}:   text: {_preview(msg.content)}")
-
-            messages.append(_assistant_to_dict(msg))
+            msg, tool_calls = self._sample_with_retry(step, messages)
 
             if not tool_calls:
                 _log(
-                    f"[tvision] step {step}: ✗ no tool call — nudging model to "
-                    f"use one"
+                    f"[tvision] step {step}: ✗ no tool call after "
+                    f"{MAX_ATTEMPTS_PER_STEP} attempts — giving up"
                 )
-                messages.append(
-                    {
-                        "role": "user",
-                        "content": (
-                            "Please call exactly one tool. If the task is complete, "
-                            "call `finish`."
-                        ),
-                    }
+                self.tracer.record_finish(
+                    step, False, "", "no tool call after retries"
                 )
-                continue
-
-            for call in tool_calls:
-                name = call.function.name
-                raw_args = call.function.arguments or "{}"
-                try:
-                    args = json.loads(raw_args)
-                except json.JSONDecodeError:
-                    args = {}
-                _log(f"[tvision] step {step}:   → {name}({_preview(raw_args, 240)})")
-
-                if name == "finish":
-                    success = bool(args.get("success", False))
-                    result_text = str(args.get("result", ""))
-                    reason = args.get("reason")
-                    messages.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": call.id,
-                            "content": "finished",
-                        }
-                    )
-                    _log(
-                        f"[tvision] step {step}:   ← finish "
-                        f"success={success} result={_preview(result_text)}"
-                    )
-                    self.tracer.record_finish(step, success, result_text, reason)
-                    return FinishResult(success, result_text, reason, step)
-
-                status = self.executor.dispatch(name, args)
-                _log(f"[tvision] step {step}:   ← {status}")
-                self.tracer.record_tool(step, name, args, status)
-                messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": call.id,
-                        "content": status,
-                    }
+                return FinishResult(
+                    False, "", "no tool call after retries", step
                 )
+
+            messages.append(_assistant_to_dict(msg))
+
+            should_continue = self._process_tool_calls(step, tool_calls, messages)
+            if isinstance(should_continue, FinishResult):
+                return should_continue
 
             img = self.browser.screenshot()
             sz = png_size(img) or (-1, -1)
@@ -261,6 +186,148 @@ class AgentLoop:
         )
         return FinishResult(False, "", "max iters reached", self.settings.max_iters)
 
+    def _sample_with_retry(
+        self, step: int, messages: list[dict]
+    ) -> tuple[Any, list[Any]]:
+        """Call the model up to MAX_ATTEMPTS_PER_STEP times, adding a nudge
+        and escalating to tool_choice='required' if the response has no
+        tool_calls. Empty assistant turns are NOT stored in history (only
+        the final usable response is). Nudges ARE stored so subsequent
+        attempts see the prior instruction."""
+        msg: Any = None
+        tool_calls: list[Any] = []
+        nudged = False
+
+        for attempt in range(MAX_ATTEMPTS_PER_STEP):
+            tag = f"{step:03d}-a{attempt}"
+            force_tool = attempt > 0
+            choice_str = "required" if force_tool else "auto"
+
+            req_path = self.tracer.dump_request(tag, _sanitize_for_dump(messages))
+            _log(
+                f"[tvision] step {step} attempt {attempt}: "
+                f"→ POST /chat/completions msgs={len(messages)} "
+                f"tool_choice={choice_str} (dump: {req_path.name})"
+            )
+            t0 = time.monotonic()
+            try:
+                resp = self._call_model(messages, force_tool=force_tool)
+            except Exception as e:
+                _log(
+                    f"[tvision] step {step} attempt {attempt}: "
+                    f"✗ API error: {type(e).__name__}: {e}"
+                )
+                raise
+            dt = time.monotonic() - t0
+
+            resp_path = self.tracer.dump_response(tag, _response_to_dict(resp))
+
+            choice = resp.choices[0]
+            msg = choice.message
+            tool_calls = list(msg.tool_calls or [])
+            usage = getattr(resp, "usage", None)
+            usage_str = ""
+            if usage:
+                comp = getattr(usage, "completion_tokens", "?")
+                prom = getattr(usage, "prompt_tokens", "?")
+                reas = None
+                ctd = getattr(usage, "completion_tokens_details", None)
+                if ctd is not None:
+                    reas = getattr(ctd, "reasoning_tokens", None)
+                usage_str = f" tokens={prom}+{comp}"
+                if reas:
+                    usage_str += f" (reasoning={reas})"
+            _log(
+                f"[tvision] step {step} attempt {attempt}: ← {dt:.2f}s "
+                f"finish={choice.finish_reason} tool_calls={len(tool_calls)}"
+                f"{usage_str} (dump: {resp_path.name})"
+            )
+
+            self.tracer.record_assistant(
+                step,
+                msg.content,
+                [
+                    {"name": tc.function.name, "arguments": tc.function.arguments}
+                    for tc in tool_calls
+                ],
+            )
+
+            if msg.content:
+                _log(f"[tvision] step {step} attempt {attempt}:   text: {_preview(msg.content)}")
+
+            if tool_calls:
+                return msg, tool_calls
+
+            # Empty (or text-only) response — surface details and retry.
+            if msg.content:
+                _log(f"[tvision] step {step} attempt {attempt}:   (text-only, no tool call)")
+                for line in (msg.content or "").splitlines() or [""]:
+                    _log(f"[tvision]      | {line}")
+            else:
+                _log(f"[tvision] step {step} attempt {attempt}:   (empty response — likely swallowed by reasoning)")
+
+            if attempt < MAX_ATTEMPTS_PER_STEP - 1:
+                if not nudged:
+                    _log(
+                        f"[tvision] step {step} attempt {attempt}: "
+                        f"adding nudge and escalating tool_choice=required"
+                    )
+                    messages.append({"role": "user", "content": EMPTY_NUDGE})
+                    nudged = True
+                else:
+                    _log(
+                        f"[tvision] step {step} attempt {attempt}: "
+                        f"retrying with tool_choice=required"
+                    )
+
+        return msg, tool_calls
+
+    def _process_tool_calls(
+        self, step: int, tool_calls: list[Any], messages: list[dict]
+    ) -> FinishResult | None:
+        """Execute each tool call, append tool results to messages. Return
+        a FinishResult if `finish` was invoked, else None to continue."""
+        for call in tool_calls:
+            name = call.function.name
+            raw_args = call.function.arguments or "{}"
+            try:
+                args = json.loads(raw_args)
+            except json.JSONDecodeError:
+                args = {}
+            _log(
+                f"[tvision] step {step}:   → {name}({_preview(raw_args, 240)})"
+            )
+
+            if name == "finish":
+                success = bool(args.get("success", False))
+                result_text = str(args.get("result", ""))
+                reason = args.get("reason")
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call.id,
+                        "content": "finished",
+                    }
+                )
+                _log(
+                    f"[tvision] step {step}:   ← finish "
+                    f"success={success} result={_preview(result_text)}"
+                )
+                self.tracer.record_finish(step, success, result_text, reason)
+                return FinishResult(success, result_text, reason, step)
+
+            status = self.executor.dispatch(name, args)
+            _log(f"[tvision] step {step}:   ← {status}")
+            self.tracer.record_tool(step, name, args, status)
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": call.id,
+                    "content": status,
+                }
+            )
+        return None
+
     def _prune_images(self, messages: list[dict]) -> None:
         window = self.settings.image_history_window
         idxs = [
@@ -281,6 +348,10 @@ class AgentLoop:
 
 
 def _assistant_to_dict(msg: Any) -> dict:
+    """Serialize an assistant message for replay. Omits the `reasoning`
+    field intentionally — we never replay the model's internal thinking
+    back to it (matches sop-agent's behavior, and prevents reasoning
+    models from doubling-down on prior empty turns)."""
     out: dict = {"role": "assistant", "content": msg.content or ""}
     if msg.tool_calls:
         out["tool_calls"] = [
