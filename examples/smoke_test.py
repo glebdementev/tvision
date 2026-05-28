@@ -11,7 +11,7 @@ from tvision.trace import Tracer
 
 def main() -> int:
     settings = Settings()
-    tracer = Tracer(Path(settings.trace_dir))
+    tracer = Tracer(Path(settings.trace_dir), Path(settings.screenshots_dir))
     client = make_client(settings)
     try:
         with BrowserSession(settings) as browser:

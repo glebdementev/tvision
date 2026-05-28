@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import sys
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -35,6 +34,47 @@ def _preview(s: str | None, n: int = 200) -> str:
     return s if len(s) <= n else s[: n - 1] + "…"
 
 
+def _sanitize_for_dump(messages: list[dict]) -> list[dict]:
+    """Strip giant base64 image data URIs from a request payload before
+    writing to disk; replace with a size marker so the structure is still
+    readable."""
+    out: list[dict] = []
+    for m in messages:
+        copy = dict(m)
+        content = copy.get("content")
+        if isinstance(content, list):
+            new_content: list[dict] = []
+            for part in content:
+                if not isinstance(part, dict):
+                    new_content.append(part)
+                    continue
+                if part.get("type") == "image_url":
+                    url = (part.get("image_url") or {}).get("url", "")
+                    new_content.append(
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"[data URI omitted: {len(url)} chars]"
+                            },
+                        }
+                    )
+                else:
+                    new_content.append(part)
+            copy["content"] = new_content
+        out.append(copy)
+    return out
+
+
+def _response_to_dict(resp: Any) -> Any:
+    try:
+        return resp.model_dump()
+    except Exception:
+        try:
+            return json.loads(resp.model_dump_json())
+        except Exception:
+            return {"repr": repr(resp)}
+
+
 class AgentLoop:
     def __init__(
         self,
@@ -61,11 +101,11 @@ class AgentLoop:
         messages: list[dict] = [{"role": "system", "content": SYSTEM}]
         img = self.browser.screenshot()
         sz = png_size(img) or (-1, -1)
+        shot_path = self.tracer.record_screenshot(0, img)
         _log(
             f"[tvision] step 0 initial screenshot: {sz[0]}x{sz[1]} "
-            f"({len(img)} bytes)"
+            f"({len(img)} bytes) → {shot_path}"
         )
-        self.tracer.record_screenshot(0, img)
         messages.append(
             {
                 "role": "user",
@@ -86,9 +126,10 @@ class AgentLoop:
 
             self._prune_images(messages)
 
+            req_path = self.tracer.dump_request(step, _sanitize_for_dump(messages))
             _log(
                 f"[tvision] step {step}: → POST /chat/completions "
-                f"msgs={len(messages)}"
+                f"msgs={len(messages)} (dump: {req_path.name})"
             )
             t0 = time.monotonic()
             try:
@@ -103,6 +144,8 @@ class AgentLoop:
                 raise
             dt = time.monotonic() - t0
 
+            resp_path = self.tracer.dump_response(step, _response_to_dict(resp))
+
             choice = resp.choices[0]
             msg = choice.message
             tool_calls = list(msg.tool_calls or [])
@@ -115,12 +158,10 @@ class AgentLoop:
             _log(
                 f"[tvision] step {step}: ← {dt:.2f}s "
                 f"finish={choice.finish_reason} tool_calls={len(tool_calls)}"
-                f"{usage_str}"
+                f"{usage_str} (dump: {resp_path.name})"
             )
-            if msg.content:
-                _log(f"[tvision] step {step}:   text: {_preview(msg.content)}")
 
-            self.tracer.record_assistant(
+            txt_path = self.tracer.record_assistant(
                 step,
                 msg.content,
                 [
@@ -129,11 +170,25 @@ class AgentLoop:
                 ],
             )
 
+            if msg.content:
+                # Print full text when no tool was called (the failure mode the
+                # user is debugging); preview otherwise so the log stays
+                # readable for the happy path.
+                if not tool_calls:
+                    _log(f"[tvision] step {step}:   assistant text (full):")
+                    for line in (msg.content or "").splitlines() or [""]:
+                        _log(f"[tvision]      | {line}")
+                    if txt_path:
+                        _log(f"[tvision]      saved → {txt_path}")
+                else:
+                    _log(f"[tvision] step {step}:   text: {_preview(msg.content)}")
+
             messages.append(_assistant_to_dict(msg))
 
             if not tool_calls:
                 _log(
-                    f"[tvision] step {step}: no tool call — nudging model to use a tool"
+                    f"[tvision] step {step}: ✗ no tool call — nudging model to "
+                    f"use one"
                 )
                 messages.append(
                     {
@@ -186,11 +241,11 @@ class AgentLoop:
 
             img = self.browser.screenshot()
             sz = png_size(img) or (-1, -1)
+            shot_path = self.tracer.record_screenshot(step, img)
             _log(
                 f"[tvision] step {step}: post-action screenshot: "
-                f"{sz[0]}x{sz[1]} ({len(img)} bytes)"
+                f"{sz[0]}x{sz[1]} ({len(img)} bytes) → {shot_path}"
             )
-            self.tracer.record_screenshot(step, img)
             messages.append(
                 {
                     "role": "user",

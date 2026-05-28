@@ -52,9 +52,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.trace_dir:
         settings.trace_dir = args.trace_dir
 
-    tracer = Tracer(settings.trace_dir)
+    tracer = Tracer(settings.trace_dir, settings.screenshots_dir)
     client = make_client(settings)
-    print(f"[tvision] trace dir: {tracer.dir}", flush=True)
+    print(f"[tvision] trace dir:       {tracer.dir}", flush=True)
+    print(f"[tvision] screenshots dir: {tracer.screenshots_dir}", flush=True)
 
     try:
         with BrowserSession(settings) as browser:

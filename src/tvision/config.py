@@ -21,3 +21,4 @@ class Settings:
     trace_dir: str = field(
         default_factory=lambda: os.getenv("TVISION_TRACE_DIR", "./traces")
     )
+    screenshots_dir: str = "./screenshots"

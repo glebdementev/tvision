@@ -11,5 +11,6 @@ venv/
 dist/
 build/
 traces/
+screenshots/
 .python-version
 .DS_Store
