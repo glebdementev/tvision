@@ -50,9 +50,17 @@ def main(argv: list[str] | None = None) -> int:
 
     tracer = Tracer(settings.trace_dir)
     client = make_client(settings)
+    print(f"[tvision] trace dir: {tracer.dir}", flush=True)
 
     try:
         with BrowserSession(settings) as browser:
+            actual = browser.actual_viewport()
+            print(
+                f"[tvision] browser ready: viewport reports {actual[0]}x{actual[1]}"
+                f" (configured {settings.viewport_width}x{settings.viewport_height},"
+                f" headed={settings.headed})",
+                flush=True,
+            )
             loop = AgentLoop(client, browser, settings, tracer)
             result = loop.run(args.task)
     finally:

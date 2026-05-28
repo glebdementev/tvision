@@ -16,16 +16,27 @@ class BrowserSession:
 
     def start(self) -> None:
         self._pw = sync_playwright().start()
-        self._browser = self._pw.chromium.launch(headless=not self.settings.headed)
+        w = self.settings.viewport_width
+        h = self.settings.viewport_height
+        # Window height = viewport + ~100px chrome (URL bar, tabs).
+        self._browser = self._pw.chromium.launch(
+            headless=not self.settings.headed,
+            args=[
+                f"--window-size={w},{h + 100}",
+                "--window-position=0,0",
+            ],
+        )
         self._context = self._browser.new_context(
-            viewport={
-                "width": self.settings.viewport_width,
-                "height": self.settings.viewport_height,
-            },
+            viewport={"width": w, "height": h},
+            screen={"width": w, "height": h},
             device_scale_factor=1,
         )
         self._page = self._context.new_page()
         self._page.set_default_timeout(self.settings.nav_timeout_ms)
+
+    def actual_viewport(self) -> tuple[int, int]:
+        size = self.page.evaluate("() => [window.innerWidth, window.innerHeight]")
+        return int(size[0]), int(size[1])
 
     @property
     def page(self) -> Page:

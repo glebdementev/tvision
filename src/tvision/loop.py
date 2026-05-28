@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sys
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -11,7 +12,7 @@ from .actions import TOOL_SCHEMAS, Executor
 from .browser import BrowserSession
 from .config import Settings
 from .prompts import SYSTEM
-from .screenshot import data_url_png
+from .screenshot import data_url_png, png_size
 from .trace import Tracer
 
 
@@ -21,6 +22,17 @@ class FinishResult:
     result: str
     reason: str | None = None
     steps: int = 0
+
+
+def _log(msg: str) -> None:
+    print(msg, flush=True)
+
+
+def _preview(s: str | None, n: int = 200) -> str:
+    if not s:
+        return ""
+    s = s.replace("\n", " ").strip()
+    return s if len(s) <= n else s[: n - 1] + "…"
 
 
 class AgentLoop:
@@ -38,10 +50,21 @@ class AgentLoop:
         self.executor = Executor(browser, settings)
 
     def run(self, task: str) -> FinishResult:
+        _log(
+            f"[tvision] model={self.settings.model} "
+            f"viewport={self.settings.viewport_width}x{self.settings.viewport_height} "
+            f"max_iters={self.settings.max_iters}"
+        )
+        _log(f"[tvision] task: {task}")
         self.tracer.record_task(task, self.settings.model)
 
         messages: list[dict] = [{"role": "system", "content": SYSTEM}]
         img = self.browser.screenshot()
+        sz = png_size(img) or (-1, -1)
+        _log(
+            f"[tvision] step 0 initial screenshot: {sz[0]}x{sz[1]} "
+            f"({len(img)} bytes)"
+        )
         self.tracer.record_screenshot(0, img)
         messages.append(
             {
@@ -57,19 +80,45 @@ class AgentLoop:
 
         for step in range(1, self.settings.max_iters + 1):
             if time.monotonic() - start > self.settings.wall_clock_timeout_s:
+                _log(f"[tvision] step {step}: wall clock timeout")
                 self.tracer.record_finish(step, False, "", "wall clock timeout")
                 return FinishResult(False, "", "wall clock timeout", step)
 
             self._prune_images(messages)
 
-            resp = self.client.chat.completions.create(
-                model=self.settings.model,
-                messages=messages,
-                tools=TOOL_SCHEMAS,
-                tool_choice="auto",
+            _log(
+                f"[tvision] step {step}: → POST /chat/completions "
+                f"msgs={len(messages)}"
             )
-            msg = resp.choices[0].message
+            t0 = time.monotonic()
+            try:
+                resp = self.client.chat.completions.create(
+                    model=self.settings.model,
+                    messages=messages,
+                    tools=TOOL_SCHEMAS,
+                    tool_choice="auto",
+                )
+            except Exception as e:
+                _log(f"[tvision] step {step}: ✗ API error: {type(e).__name__}: {e}")
+                raise
+            dt = time.monotonic() - t0
+
+            choice = resp.choices[0]
+            msg = choice.message
             tool_calls = list(msg.tool_calls or [])
+            usage = getattr(resp, "usage", None)
+            usage_str = (
+                f" tokens={usage.prompt_tokens}+{usage.completion_tokens}"
+                if usage
+                else ""
+            )
+            _log(
+                f"[tvision] step {step}: ← {dt:.2f}s "
+                f"finish={choice.finish_reason} tool_calls={len(tool_calls)}"
+                f"{usage_str}"
+            )
+            if msg.content:
+                _log(f"[tvision] step {step}:   text: {_preview(msg.content)}")
 
             self.tracer.record_assistant(
                 step,
@@ -83,6 +132,9 @@ class AgentLoop:
             messages.append(_assistant_to_dict(msg))
 
             if not tool_calls:
+                _log(
+                    f"[tvision] step {step}: no tool call — nudging model to use a tool"
+                )
                 messages.append(
                     {
                         "role": "user",
@@ -96,10 +148,12 @@ class AgentLoop:
 
             for call in tool_calls:
                 name = call.function.name
+                raw_args = call.function.arguments or "{}"
                 try:
-                    args = json.loads(call.function.arguments or "{}")
+                    args = json.loads(raw_args)
                 except json.JSONDecodeError:
                     args = {}
+                _log(f"[tvision] step {step}:   → {name}({_preview(raw_args, 240)})")
 
                 if name == "finish":
                     success = bool(args.get("success", False))
@@ -112,10 +166,15 @@ class AgentLoop:
                             "content": "finished",
                         }
                     )
+                    _log(
+                        f"[tvision] step {step}:   ← finish "
+                        f"success={success} result={_preview(result_text)}"
+                    )
                     self.tracer.record_finish(step, success, result_text, reason)
                     return FinishResult(success, result_text, reason, step)
 
                 status = self.executor.dispatch(name, args)
+                _log(f"[tvision] step {step}:   ← {status}")
                 self.tracer.record_tool(step, name, args, status)
                 messages.append(
                     {
@@ -126,6 +185,11 @@ class AgentLoop:
                 )
 
             img = self.browser.screenshot()
+            sz = png_size(img) or (-1, -1)
+            _log(
+                f"[tvision] step {step}: post-action screenshot: "
+                f"{sz[0]}x{sz[1]} ({len(img)} bytes)"
+            )
             self.tracer.record_screenshot(step, img)
             messages.append(
                 {
@@ -136,6 +200,7 @@ class AgentLoop:
                 }
             )
 
+        _log(f"[tvision] max iters ({self.settings.max_iters}) reached")
         self.tracer.record_finish(
             self.settings.max_iters, False, "", "max iters reached"
         )
